@@ -5,11 +5,13 @@ import StringIO
 import csv
 import datetime
 from itertools import groupby
+import urllib
 
 from django.conf import settings
 from django_dynamic_fixture import G
 from iso3166 import countries
 import pytz
+from opaque_keys.edx.keys import CourseKey
 
 from analytics_data_api.v0 import models
 from analytics_data_api.v0.constants import UNKNOWN_COUNTRY, UNKNOWN_COUNTRY_CODE
@@ -19,12 +21,29 @@ from analytics_data_api.v0.tests.utils import flatten
 from analyticsdataserver.tests import TestCaseWithAuthentication
 
 
+DEMO_COURSE_ID = 'course-v1:edX+DemoX+Demo_2014'
+
+
+class DemoCourseMixin(object):
+    course_key = None
+    course_id = None
+
+    def setUp(self):
+        self.course_id = DEMO_COURSE_ID
+        self.course_key = CourseKey.from_string(self.course_id)
+        super(DemoCourseMixin, self).setUp()
+
+
 # pylint: disable=no-member
-class CourseViewTestCaseMixin(object):
+class CourseViewTestCaseMixin(DemoCourseMixin):
     model = None
     api_root_path = '/api/v0/'
     path = None
     order_by = []
+    csv_filename_slug = None
+
+    def generate_data(self, course_id=None):
+        raise NotImplementedError
 
     def format_as_response(self, *args):
         """
@@ -35,7 +54,7 @@ class CourseViewTestCaseMixin(object):
         """
         raise NotImplementedError
 
-    def get_latest_data(self):
+    def get_latest_data(self, course_id=None):
         """
         Return the latest row/rows that would be returned if a user made a call
         to the endpoint with no date filtering.
@@ -43,6 +62,9 @@ class CourseViewTestCaseMixin(object):
         Return value must be an iterable.
         """
         raise NotImplementedError
+
+    def get_csv_filename(self):
+        return u'edX-DemoX-Demo_2014--{0}.csv'.format(self.csv_filename_slug)
 
     def test_get_not_found(self):
         """ Requests made against non-existent courses should return a 404 """
@@ -60,18 +82,18 @@ class CourseViewTestCaseMixin(object):
         expected = self.format_as_response(*self.get_latest_data())
         self.assertEquals(response.data, expected)
 
-    def test_get_csv(self):
-        """ Verify the endpoint returns data that has been properly converted to CSV. """
-        path = '%scourses/%s%s' % (self.api_root_path, self.course_id, self.path)
+    def assertCSVIsValid(self, course_id, filename):
+        path = '{0}courses/{1}{2}'.format(self.api_root_path, course_id, self.path)
         csv_content_type = 'text/csv'
         response = self.authenticated_get(path, HTTP_ACCEPT=csv_content_type)
 
-        # Validate the basic response status and content code
+        # Validate the basic response status, content type, and filename
         self.assertEquals(response.status_code, 200)
         self.assertEquals(response['Content-Type'].split(';')[0], csv_content_type)
+        self.assertEquals(response['Content-Disposition'], u'attachment; filename={}'.format(filename))
 
         # Validate the actual data
-        data = self.format_as_response(*self.get_latest_data())
+        data = self.format_as_response(*self.get_latest_data(course_id=course_id))
         data = map(flatten, data)
 
         # The CSV renderer sorts the headers alphabetically
@@ -82,8 +104,20 @@ class CourseViewTestCaseMixin(object):
         writer = csv.DictWriter(expected, fieldnames)
         writer.writeheader()
         writer.writerows(data)
-
         self.assertEqual(response.content, expected.getvalue())
+
+    def test_get_csv(self):
+        """ Verify the endpoint returns data that has been properly converted to CSV. """
+        self.assertCSVIsValid(self.course_id, self.get_csv_filename())
+
+    def test_get_csv_with_deprecated_key(self):
+        """
+        Verify the endpoint returns data that has been properly converted to CSV even if the course ID is deprecated.
+        """
+        course_id = u'edX/DemoX/Demo_Course'
+        self.generate_data(course_id)
+        filename = u'{0}--{1}.csv'.format(u'edX-DemoX-Demo_Course', self.csv_filename_slug)
+        self.assertCSVIsValid(course_id, filename)
 
     def test_get_with_intervals(self):
         """ Verify the endpoint returns multiple data points when supplied with an interval of dates. """
@@ -115,38 +149,42 @@ class CourseViewTestCaseMixin(object):
 
 # pylint: disable=abstract-method
 class CourseEnrollmentViewTestCaseMixin(CourseViewTestCaseMixin):
+    date = None
+
     def setUp(self):
         super(CourseEnrollmentViewTestCaseMixin, self).setUp()
-        self.course_id = 'edX/DemoX/Demo_Course'
         self.date = datetime.date(2014, 1, 1)
 
-    def get_latest_data(self):
-        return self.model.objects.filter(date=self.date).order_by('date', *self.order_by)
+    def get_latest_data(self, course_id=None):
+        course_id = course_id or self.course_id
+        return self.model.objects.filter(course_id=course_id, date=self.date).order_by('date', *self.order_by)
 
     def test_get_with_intervals(self):
         expected = self.format_as_response(*self.model.objects.filter(date=self.date))
         self.assertIntervalFilteringWorks(expected, self.date, self.date + datetime.timedelta(days=1))
 
 
-class CourseActivityLastWeekTest(TestCaseWithAuthentication):
-    # pylint: disable=line-too-long
-    def setUp(self):
-        super(CourseActivityLastWeekTest, self).setUp()
-        self.course_id = 'edX/DemoX/Demo_Course'
+class CourseActivityLastWeekTest(DemoCourseMixin, TestCaseWithAuthentication):
+    def generate_data(self, course_id=None):
+        course_id = course_id or self.course_id
         interval_start = datetime.datetime(2014, 1, 1, tzinfo=pytz.utc)
         interval_end = interval_start + datetime.timedelta(weeks=1)
-        # G(models.CourseActivityWeekly, course_id=self.course_id, interval_start=interval_start,
-        #   interval_end=interval_end,
-        #   activity_type='POSTED_FORUM', count=100)
-        G(models.CourseActivityWeekly, course_id=self.course_id, interval_start=interval_start,
+        # G(models.CourseActivityWeekly, course_id=course_id, interval_start=interval_start,
+        # interval_end=interval_end,
+        # activity_type='POSTED_FORUM', count=100)
+        G(models.CourseActivityWeekly, course_id=course_id, interval_start=interval_start,
           interval_end=interval_end,
           activity_type='ATTEMPTED_PROBLEM', count=200)
-        G(models.CourseActivityWeekly, course_id=self.course_id, interval_start=interval_start,
+        G(models.CourseActivityWeekly, course_id=course_id, interval_start=interval_start,
           interval_end=interval_end,
           activity_type='ACTIVE', count=300)
-        G(models.CourseActivityWeekly, course_id=self.course_id, interval_start=interval_start,
+        G(models.CourseActivityWeekly, course_id=course_id, interval_start=interval_start,
           interval_end=interval_end,
           activity_type='PLAYED_VIDEO', count=400)
+
+    def setUp(self):
+        super(CourseActivityLastWeekTest, self).setUp()
+        self.generate_data()
 
     def test_activity(self):
         response = self.authenticated_get('/api/v0/courses/{0}/recent_activity'.format(self.course_id))
@@ -162,7 +200,7 @@ class CourseActivityLastWeekTest(TestCaseWithAuthentication):
     @staticmethod
     def get_activity_record(**kwargs):
         default = {
-            'course_id': 'edX/DemoX/Demo_Course',
+            'course_id': DEMO_COURSE_ID,
             'interval_start': datetime.datetime(2014, 1, 1, 0, 0, tzinfo=pytz.utc),
             'interval_end': datetime.datetime(2014, 1, 8, 0, 0, tzinfo=pytz.utc),
             'activity_type': 'any',
@@ -177,7 +215,8 @@ class CourseActivityLastWeekTest(TestCaseWithAuthentication):
         self.assertEquals(response.status_code, 401)
 
     def test_url_encoded_course_id(self):
-        response = self.authenticated_get('/api/v0/courses/edX%2FDemoX%2FDemo_Course/recent_activity')
+        url_encoded_course_id = urllib.quote_plus(self.course_id)
+        response = self.authenticated_get('/api/v0/courses/{}/recent_activity'.format(url_encoded_course_id))
         self.assertEquals(response.status_code, 200)
         self.assertEquals(response.data, self.get_activity_record())
 
@@ -214,13 +253,18 @@ class CourseEnrollmentByBirthYearViewTests(CourseEnrollmentViewTestCaseMixin, Te
     path = '/enrollment/birth_year'
     model = models.CourseEnrollmentByBirthYear
     order_by = ['birth_year']
+    csv_filename_slug = u'enrollment-age'
+
+    def generate_data(self, course_id=None):
+        course_id = course_id or self.course_id
+        G(self.model, course_id=course_id, date=self.date, birth_year=1956)
+        G(self.model, course_id=course_id, date=self.date, birth_year=1986)
+        G(self.model, course_id=course_id, date=self.date - datetime.timedelta(days=10), birth_year=1956)
+        G(self.model, course_id=course_id, date=self.date - datetime.timedelta(days=10), birth_year=1986)
 
     def setUp(self):
         super(CourseEnrollmentByBirthYearViewTests, self).setUp()
-        G(self.model, course_id=self.course_id, date=self.date, birth_year=1956)
-        G(self.model, course_id=self.course_id, date=self.date, birth_year=1986)
-        G(self.model, course_id=self.course_id, date=self.date - datetime.timedelta(days=10), birth_year=1956)
-        G(self.model, course_id=self.course_id, date=self.date - datetime.timedelta(days=10), birth_year=1986)
+        self.generate_data()
 
     def format_as_response(self, *args):
         return [
@@ -239,15 +283,19 @@ class CourseEnrollmentByEducationViewTests(CourseEnrollmentViewTestCaseMixin, Te
     path = '/enrollment/education/'
     model = models.CourseEnrollmentByEducation
     order_by = ['education_level']
+    csv_filename_slug = u'enrollment-education'
+
+    def generate_data(self, course_id=None):
+        course_id = course_id or self.course_id
+        G(self.model, course_id=course_id, date=self.date, education_level=self.el1)
+        G(self.model, course_id=course_id, date=self.date, education_level=self.el2)
+        G(self.model, course_id=course_id, date=self.date - datetime.timedelta(days=2), education_level=self.el2)
 
     def setUp(self):
         super(CourseEnrollmentByEducationViewTests, self).setUp()
         self.el1 = G(models.EducationLevel, name='Doctorate', short_name='doctorate')
         self.el2 = G(models.EducationLevel, name='Top Secret', short_name='top_secret')
-        G(self.model, course_id=self.course_id, date=self.date, education_level=self.el1)
-        G(self.model, course_id=self.course_id, date=self.date, education_level=self.el2)
-        G(self.model, course_id=self.course_id, date=self.date - datetime.timedelta(days=2),
-          education_level=self.el2)
+        self.generate_data()
 
     def format_as_response(self, *args):
         return [
@@ -261,12 +309,17 @@ class CourseEnrollmentByGenderViewTests(CourseEnrollmentViewTestCaseMixin, TestC
     path = '/enrollment/gender/'
     model = models.CourseEnrollmentByGender
     order_by = ['gender']
+    csv_filename_slug = u'enrollment-gender'
+
+    def generate_data(self, course_id=None):
+        course_id = course_id or self.course_id
+        G(self.model, course_id=course_id, gender='m', date=self.date, count=34)
+        G(self.model, course_id=course_id, gender='f', date=self.date, count=45)
+        G(self.model, course_id=course_id, gender='f', date=self.date - datetime.timedelta(days=2), count=45)
 
     def setUp(self):
         super(CourseEnrollmentByGenderViewTests, self).setUp()
-        G(self.model, course_id=self.course_id, gender='m', date=self.date, count=34)
-        G(self.model, course_id=self.course_id, gender='f', date=self.date, count=45)
-        G(self.model, course_id=self.course_id, gender='f', date=self.date - datetime.timedelta(days=2), count=45)
+        self.generate_data()
 
     def format_as_response(self, *args):
         return [
@@ -308,11 +361,16 @@ class AnswerDistributionTests(TestCaseWithAuthentication):
 class CourseEnrollmentViewTests(CourseEnrollmentViewTestCaseMixin, TestCaseWithAuthentication):
     model = models.CourseEnrollmentDaily
     path = '/enrollment'
+    csv_filename_slug = u'enrollment'
+
+    def generate_data(self, course_id=None):
+        course_id = course_id or self.course_id
+        G(self.model, course_id=course_id, date=self.date, count=203)
+        G(self.model, course_id=course_id, date=self.date - datetime.timedelta(days=5), count=203)
 
     def setUp(self):
         super(CourseEnrollmentViewTests, self).setUp()
-        G(self.model, course_id=self.course_id, date=self.date, count=203)
-        G(self.model, course_id=self.course_id, date=self.date - datetime.timedelta(days=5), count=203)
+        self.generate_data()
 
     def format_as_response(self, *args):
         return [
@@ -324,6 +382,7 @@ class CourseEnrollmentViewTests(CourseEnrollmentViewTestCaseMixin, TestCaseWithA
 class CourseEnrollmentByLocationViewTests(CourseEnrollmentViewTestCaseMixin, TestCaseWithAuthentication):
     path = '/enrollment/location/'
     model = models.CourseEnrollmentByCountry
+    csv_filename_slug = u'enrollment-location'
 
     def format_as_response(self, *args):
         unknown = {'course_id': None, 'count': 0, 'date': None,
@@ -348,19 +407,22 @@ class CourseEnrollmentByLocationViewTests(CourseEnrollmentViewTestCaseMixin, Tes
 
         return response
 
+    def generate_data(self, course_id=None):
+        course_id = course_id or self.course_id
+        G(self.model, course_id=course_id, country_code='US', count=455, date=self.date)
+        G(self.model, course_id=course_id, country_code='CA', count=356, date=self.date)
+        G(self.model, course_id=course_id, country_code='IN', count=12, date=self.date - datetime.timedelta(days=29))
+        G(self.model, course_id=course_id, country_code='', count=356, date=self.date)
+        G(self.model, course_id=course_id, country_code='A1', count=1, date=self.date)
+        G(self.model, course_id=course_id, country_code='A2', count=2, date=self.date)
+        G(self.model, course_id=course_id, country_code='AP', count=1, date=self.date)
+        G(self.model, course_id=course_id, country_code='EU', count=4, date=self.date)
+        G(self.model, course_id=course_id, country_code='O1', count=7, date=self.date)
+
     def setUp(self):
         super(CourseEnrollmentByLocationViewTests, self).setUp()
         self.country = countries.get('US')
-        G(self.model, course_id=self.course_id, country_code='US', count=455, date=self.date)
-        G(self.model, course_id=self.course_id, country_code='CA', count=356, date=self.date)
-        G(self.model, course_id=self.course_id, country_code='IN', count=12,
-          date=self.date - datetime.timedelta(days=29))
-        G(self.model, course_id=self.course_id, country_code='', count=356, date=self.date)
-        G(self.model, course_id=self.course_id, country_code='A1', count=1, date=self.date)
-        G(self.model, course_id=self.course_id, country_code='A2', count=2, date=self.date)
-        G(self.model, course_id=self.course_id, country_code='AP', count=1, date=self.date)
-        G(self.model, course_id=self.course_id, country_code='EU', count=4, date=self.date)
-        G(self.model, course_id=self.course_id, country_code='O1', count=7, date=self.date)
+        self.generate_data()
 
 
 class CourseActivityWeeklyViewTests(CourseViewTestCaseMixin, TestCaseWithAuthentication):
@@ -369,23 +431,29 @@ class CourseActivityWeeklyViewTests(CourseViewTestCaseMixin, TestCaseWithAuthent
     model = CourseActivityWeekly
     # activity_types = ['ACTIVE', 'ATTEMPTED_PROBLEM', 'PLAYED_VIDEO', 'POSTED_FORUM']
     activity_types = ['ACTIVE', 'ATTEMPTED_PROBLEM', 'PLAYED_VIDEO']
+    csv_filename_slug = u'engagement-activity'
 
-    def setUp(self):
-        super(CourseActivityWeeklyViewTests, self).setUp()
-        self.course_id = 'edX/DemoX/Demo_Course'
-        self.interval_start = datetime.datetime(2014, 1, 1, tzinfo=pytz.utc)
-        self.interval_end = self.interval_start + datetime.timedelta(weeks=1)
+    def generate_data(self, course_id=None):
+        course_id = course_id or self.course_id
 
         for activity_type in self.activity_types:
             G(CourseActivityWeekly,
-              course_id=self.course_id,
+              course_id=course_id,
               interval_start=self.interval_start,
               interval_end=self.interval_end,
               activity_type=activity_type,
               count=100)
 
-    def get_latest_data(self):
-        return self.model.objects.filter(course_id=self.course_id, interval_end=self.interval_end)
+    def setUp(self):
+        super(CourseActivityWeeklyViewTests, self).setUp()
+        self.interval_start = datetime.datetime(2014, 1, 1, tzinfo=pytz.utc)
+        self.interval_end = self.interval_start + datetime.timedelta(weeks=1)
+
+        self.generate_data()
+
+    def get_latest_data(self, course_id=None):
+        course_id = course_id or self.course_id
+        return self.model.objects.filter(course_id=course_id, interval_end=self.interval_end)
 
     def format_as_response(self, *args):
         response = []
